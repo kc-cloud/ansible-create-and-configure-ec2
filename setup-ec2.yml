@@ -1,0 +1,125 @@
+---
+
+- hosts: localhost
+  vars:
+    #vm_name: "rhel-instance"
+    #vm_type: t2.micro
+    #vm_ami_id: "ami-0b15fe187e9b21725"
+    #vm_ssh_user: "ec2-user"
+    #vm_subnet_id: "subnet-054be42e9f8c0e2c4"
+    #vm_vpc_id: "vpc-0b7df91e2f12e92c8"
+    #vm_sg_id: "sg-0faaa54f04309e30b"
+    #vm_iam_instance_profile: "test-access"
+    #vm_key_name: "mgmt-keypair"
+    #vm_key_file_loc: "/home/kannanc/keys/mgmt-keypair.pem"
+    vm_test: ""
+  tasks:
+    - name: Install boto3 and botocore with pip3 module
+      pip:
+        name:
+          - boto3
+          - botocore
+    - name: Launch an instance
+      ec2_instance:
+        name: "{{ vm_name }}" 
+        vpc_subnet_id: "{{ vm_subnet_id }}"
+        image_id: "{{ vm_ami_id }}"
+        instance_role: "{{ vm_iam_instance_profile }}"
+        instance_type: "{{ vm_type }}"
+        key_name: "{{ vm_key_name }}"
+        security_group: "{{ vm_sg_id }}"
+        user_data: |
+          #!/bin/bash -xe
+          exec > /tmp/logs/userdata.log 2>&1
+          set +e
+          yum update -y
+          /bin/sh /artifacts/dynatrace/Dynatrace-OneAgent-Linux-1.193.159.sh --set-app-log-content-access=true --set-infra-only=false
+          /opt/dynatrace/oneagent/agent/tools/oneagentctl --set-host-group=prod --restart-service
+          /artifacts/splunk/install-splunk-uf-service.sh
+          aws ec2 --region us-east-1 create-tags --resources $instance_id --tags Key=:"boot-status",Value="success"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: 80
+              delete_on_termination: true
+      register: ec2
+
+    - debug:
+        var: ec2.instances
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ ec2.instances.0.private_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 360
+        state: started
+
+    - name: Add hosts group temporary inventory group with pem path
+      add_host:
+        groups: dynamic_hosts
+        name: "{{ ec2.instances.0.private_ip_address }}"
+        ansible_ssh_host: "{{ ec2.instances.0.private_ip_address }}"
+        ansible_ssh_private_key_file: "{{ vm_key_file_loc }}"
+        ansible_ssh_user: "{{ vm_ssh_user }}"
+
+- hosts: dynamic_hosts
+  remote_user: ec2-user
+  become: yes
+  become_method: sudo
+  environment:
+    ANSIBLE_LOG_PATH: /tmp/logs/ansible.log
+  vars:
+    test_result: "{{ result_file_location }}"
+    services_list:
+      - oneagent
+  tasks:
+  - ping:
+
+  - name: Check if reboot is required
+    shell: needs-restarting -r
+    register: is_reboot_required
+  
+  - name: Reboot
+    reboot:
+      reboot_timeout: 3600
+    when: is_reboot_required.rc == 1
+
+  - name: Test dynatrace agent
+    block:
+    - shell: service oneagent status 
+      register: dt_status
+    - delegate_to: localhost 
+      copy:  
+        content: "Dynatrace OneAgent service is NOT enabled"
+        dest: "{{ test_result }}"
+      when: "'Dynatrace OneAgent service started' not in dt_status.stdout"
+    - fail: 
+        msg: "Dynatrace OneAgent service is NOT enabled"
+      when: "'Dynatrace OneAgent service started' not in dt_status.stdout"
+    - name: start the service if it's enabled
+      debug:
+        msg: "Dynatrace OneAgent service is started"
+      when: "'Dynatrace OneAgent service started' in dt_status.stdout"
+
+  - name: Test splunk uf
+    block:
+    - shell: /opt/splunkforwarder/bin/splunk status 
+      register: splunk_status
+    - delegate_to: localhost
+      copy:
+        content: "splunk universal forwarder is not running"
+        dest: "{{ test_result }}"
+      when: "'splunkd is running' not in splunk_status.stdout"
+    - fail:
+        msg: "splunk universal forwarder is not installed properly"
+      when: "'splunkd is running' not in splunk_status.stdout"
+    - debug:
+        msg: "splunk agent verified successfully"
+      when: "'splunkd is running' in splunk_status.stdout"
+
+  - delegate_to: localhost
+    copy:
+      content: "Test Passed"
+      dest: "{{ test_result }}"
+    
